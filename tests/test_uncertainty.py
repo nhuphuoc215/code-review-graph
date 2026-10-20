@@ -760,6 +760,85 @@ def _raise_file_not_found(*_args, **_kwargs):
     raise FileNotFoundError("git")
 
 
+def _index_file(store: GraphStore, path: Path) -> None:
+    store.upsert_node(NodeInfo(
+        kind="File", name=path.as_posix(), file_path=path.as_posix(),
+        line_start=1, line_end=1, language="python",
+    ))
+    store.commit()
+
+
+def test_untracked_sources_skips_files_the_graph_already_holds(repo):
+    """`watch` indexes a file git has never seen; that file is not missing."""
+    _tracked_repo(repo)
+    watched = repo / "watched.py"
+    watched.write_text("import auth\n", encoding="utf-8")
+    (repo / "unseen.py").write_text("import auth\n", encoding="utf-8")
+
+    with _store(repo) as store:
+        _index_file(store, watched)
+        assert uncertainty._untracked_sources(repo, store) == 1
+
+
+def _subfolder_graph(top: Path) -> Path:
+    """A repository at *top* whose graph is rooted at ``top/svc``."""
+    import subprocess
+
+    svc = top / "svc"
+    svc.mkdir(parents=True)
+    (svc / ".code-review-graph").mkdir()
+    auth = svc / "auth.py"
+    auth.write_text("def login():\n    pass\n", encoding="utf-8")
+    for args in (["init", "-q"], ["add", "svc/auth.py"]):
+        subprocess.run(
+            ["git", *args], cwd=str(top), check=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    with GraphStore(svc / ".code-review-graph" / "graph.db") as store:
+        _index_file(store, auth)
+    return svc
+
+
+def test_untracked_sources_ignores_files_outside_a_subfolder_graph_root(tmp_path):
+    """A sibling of the graph root is not source the graph was offered."""
+    svc = _subfolder_graph(tmp_path.resolve() / "mono")
+    other = svc.parent / "other"
+    other.mkdir()
+    (other / "scratch.py").write_text("x = 1\n", encoding="utf-8")
+    (svc / "new.py").write_text("x = 1\n", encoding="utf-8")
+
+    with GraphStore(svc / ".code-review-graph" / "graph.db") as store:
+        assert uncertainty._untracked_sources(svc, store) == 1
+
+
+def test_untracked_sources_matches_indexed_paths_under_a_subfolder_root(tmp_path):
+    """Paths from git must resolve against the graph root, not the top level.
+
+    `git status --porcelain` prints top-level-relative paths, so joining them
+    to a subfolder root doubles the prefix and no indexed file ever matches.
+    """
+    svc = _subfolder_graph(tmp_path.resolve() / "mono")
+    watched = svc / "watched.py"
+    watched.write_text("x = 1\n", encoding="utf-8")
+
+    with GraphStore(svc / ".code-review-graph" / "graph.db") as store:
+        _index_file(store, watched)
+        assert uncertainty._untracked_sources(svc, store) == 0
+
+
+def test_empty_git_timeout_does_not_break_import():
+    """An empty CRG_GIT_TIMEOUT falls back like every other module's does."""
+    import subprocess
+    import sys
+
+    result = subprocess.run(
+        [sys.executable, "-c", "import code_review_graph.uncertainty"],
+        env={**os.environ, "CRG_GIT_TIMEOUT": ""},
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+
 def _commit(root: Path) -> None:
     """A HEAD to compare against; _tracked_repo only stages."""
     import subprocess

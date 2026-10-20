@@ -31,7 +31,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from .constants import GIT_TIMEOUT
 from .graph import _sanitize_name
+from .parser import normalize_file_path
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .graph import GraphStore
@@ -48,9 +50,6 @@ IMPACT_PATTERN = "impact_radius"
 
 _UPDATE_HINT = "run `code-review-graph update`"
 
-# Same budget, and the same knob, incremental.py gives its git calls. This one
-# only runs on an empty result, never on the hot path.
-_GIT_TIMEOUT = int(os.environ.get("CRG_GIT_TIMEOUT", "30"))  # seconds
 _WHITESPACE = re.compile(r"\s+")
 
 
@@ -306,18 +305,27 @@ def _untracked_sources(root: Path, store: GraphStore) -> int:
 
     "Source" is calibrated from the graph rather than a fixed extension list,
     so a repo whose languages this build does not parse never reports a file
-    the index was never going to hold. ``--porcelain`` already honours
+    the index was never going to hold. ``--exclude-standard`` honours
     ``.gitignore``, so build output and vendored trees stay out.
+
+    A file the graph already holds is not counted: ``watch`` indexes a new
+    file whether or not git has seen it. ``ls-files`` lists only what lies
+    under ``root`` (``-- .`` says so explicitly), so a graph rooted below the
+    repository top level never counts its siblings, and it prints paths
+    relative to ``root``. ``git status --porcelain`` does neither: it reports
+    the whole repository relative to the top level, and those paths never
+    match a stored one once the graph root is a subfolder.
     """
-    indexed_suffixes = {Path(f).suffix for f in store.get_all_files() if Path(f).suffix}
+    indexed_files = set(store.get_all_files())
+    indexed_suffixes = {Path(f).suffix for f in indexed_files if Path(f).suffix}
     if not indexed_suffixes:
         return 0
     try:
         result = subprocess.run(
-            ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+            ["git", "ls-files", "--others", "--exclude-standard", "-z", "--", "."],
             capture_output=True,
             cwd=str(root),
-            timeout=_GIT_TIMEOUT,
+            timeout=GIT_TIMEOUT,
             stdin=subprocess.DEVNULL,
         )
     except (FileNotFoundError, OSError, subprocess.SubprocessError):
@@ -326,11 +334,10 @@ def _untracked_sources(root: Path, store: GraphStore) -> int:
         return 0
     count = 0
     for record in result.stdout.split(b"\0"):
-        # "?? <path>": only the untracked ones; everything else is already
-        # reachable through the diff that drives an incremental update.
-        if not record.startswith(b"?? ") or len(record) <= 3:
+        if not record:
             continue
-        if Path(os.fsdecode(record[3:])).suffix in indexed_suffixes:
+        path = root / os.fsdecode(record)
+        if path.suffix in indexed_suffixes and normalize_file_path(path) not in indexed_files:
             count += 1
     return count
 
